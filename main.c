@@ -5,18 +5,21 @@
 #include <string.h>
 
 #define ERROR -1
+#define MISS_PENALTY 100
 
 typedef struct linea {
     bool validez;
     bool dirtybit;
     int tag;
     int bloque;
+    int ultima_operacion;
 } Linea;
 
 typedef struct set {
     Linea **lineas; 
     int cantidad_lineas;
     int tamanio_bloque;
+    int lineas_ocupadas;
 } Set;
 
 typedef struct metrics {
@@ -39,12 +42,13 @@ typedef struct cache {
     bool mapeo_directo;
 } Cache;
 
-typedef struct entrada {
-    u_int32_t instruction_pointer;
+typedef struct entrada { 
+    int numero_de_operacion;
+    int instruction_pointer;
     char operacion;
-    u_int32_t direccion;
+    int direccion;
     int tamanio_operacion;
-    u_int32_t datos_leidos;
+    int datos_leidos;
 } Entrada;
 
 bool son_potencia_2(char const *argv[]){
@@ -57,81 +61,267 @@ bool son_potencia_2(char const *argv[]){
     return true;
 }
 
-void seti_y_tag(u_int32_t direccion, int *set_index, int *tag){ //aplic amas para conseguir el tag, set index y block offset
+void seti_y_tag(u_int32_t *direccion, int tamanio_seti, int tamanio_block_offset, int *set_index, int *tag){
 
+    int mask_s_b = (0x01 << (tamanio_block_offset + tamanio_seti)) - 1;
+    int mask_b = (0x01 << tamanio_block_offset) - 1;
+    int mask_s = mask_s_b ^ mask_b;
+    *set_index = (mask_s & *(int*)direccion) >> tamanio_block_offset;
+    int mask_tag = mask_s_b ^ 0xffffffff;
+    int32_t aux = (*direccion & mask_tag);
+    aux = aux >> (tamanio_block_offset + tamanio_seti);
+    int tamanio_tag = 32 - ((tamanio_block_offset + tamanio_seti));
+    int mask_tdos = (0x01 << tamanio_tag) - 1;
+    *tag = mask_tdos & aux;
 }
 
-void modo_simple(){ // modo simple
+void crear_lineas(Set *set, int cant_lineas){ 
 
+    set->lineas = calloc(cant_lineas, sizeof(Linea*));
+    if(!set->lineas){
+        return;
+    }
+    for(int i = 0; i < cant_lineas; i++){
+        set->lineas[i] = calloc(1, sizeof(Linea));
+        set->lineas[i]->validez = false;
+        set->lineas[i]->dirtybit = false;
+    }
 }
 
-Cache *crear_cache(char const *parametros[]){ // guarda memoria para el cache
+Cache *crear_cache(char const *parametros[]){
     Cache *cache = calloc(1, sizeof(Cache));
     if(!cache)
         return NULL;
 
-    cache->cantidad_sets = parametros[4];                               //S
-    cache->sets = calloc(cache->cantidad_sets, sizeof(Set));
+    cache->cantidad_sets = atoi(parametros[4]);                            
+    cache->sets = calloc(cache->cantidad_sets, sizeof(Set*));
     for(int i = 0; i < cache->cantidad_sets; i++) {
-        cache->sets[i]->lineas = crear_lineas(atoi(parametros[3])); //Lineas
+        cache->sets[i] = calloc(1, sizeof(Set));
+        crear_lineas(cache->sets[i], atoi(parametros[3])); 
         cache->sets[i]->cantidad_lineas = atoi(parametros[3]);
+        cache->sets[i]->lineas_ocupadas = 0;
     }
     cache->metrics = calloc(1, sizeof(Metrics));
     cache->mapeo_directo = false;
     if(atoi(parametros[3]) == 1)
         cache->mapeo_directo = true;
-
     return cache;
 }
 
-Linea **crear_lineas(int cant_lineas){ //crea lineas del cache
-    Linea **lineas = calloc(cant_lineas, sizeof(Linea));
-    if(!lineas)
-        return NULL;
-    for(int i = 0; i < cant_lineas; i++){
-        lineas[i]->validez = false;
-        lineas[i]->dirtybit = false;
+Linea *encontrar_linea(Set *set_actual, int32_t tag){
+
+    for(int i = 0; i < set_actual->cantidad_lineas; i++){
+        Linea *linea_actual = set_actual->lineas[i];
+
+        if(linea_actual->tag == tag){
+            return linea_actual;
+        }
     }
-    return lineas
+    return NULL;
 }
 
-int main(int argc, char const *argv[]){
+Linea *least_recently_used(Set *set_actual){
+    
+    Linea *ultima_linea_usada = set_actual->lineas[0];
+    int num_linea = 0;
+    for(int i = 1; i < set_actual->cantidad_lineas; i++){
+        if(ultima_linea_usada->ultima_operacion > set_actual->lineas[i]->ultima_operacion){
+            ultima_linea_usada = set_actual->lineas[i];
+            num_linea = i;
+        }
+    }
+    return ultima_linea_usada;
+}
 
-    if(argc != 5 && argc != 8) //console command no es tamanio correcto
+void linea_fria(Set *set_actual, Metrics *metrics, int tag, Entrada *operacion_actual, int bytesxbloque){ 
+
+   for(int i = 0; i < set_actual->cantidad_lineas; i++){
+       if(set_actual->lineas[i]->validez == false){
+            Linea *linea_actual = set_actual->lineas[i];
+            linea_actual->tag = tag;
+            linea_actual->validez = true;
+            linea_actual->ultima_operacion = operacion_actual->numero_de_operacion;
+            set_actual->lineas_ocupadas++;
+            if(strcmp(&(operacion_actual->operacion), "W") == 0){
+                linea_actual->dirtybit = true;
+                metrics->bytes_read += bytesxbloque;
+                metrics->wmiss++;
+                metrics->stores++;
+                metrics->write_time += 1+MISS_PENALTY;
+                return;
+            }
+            else if(strcmp(&(operacion_actual->operacion), "R") == 0){ 
+                metrics->read_time += 1+MISS_PENALTY;
+                metrics->loads++;
+                metrics->rmiss++;
+                metrics->bytes_read += bytesxbloque;
+                return;
+            }
+       }
+   }
+}
+
+void linea_clean_miss(Set *set_actual, Metrics *metrics, int tag, Entrada *operacion_actual, Linea *linea_actual, int bytesxbloque){
+
+    linea_actual->ultima_operacion = operacion_actual->numero_de_operacion;
+    if(strcmp(&(operacion_actual->operacion), "W") == 0){
+        linea_actual->dirtybit = true;
+        linea_actual->tag = tag;
+        metrics->bytes_read +=  bytesxbloque;
+        metrics->stores++;
+        metrics->wmiss++;
+        metrics->write_time += 1 + MISS_PENALTY;
+    }
+    else if(strcmp(&(operacion_actual->operacion), "R") == 0){   
+        linea_actual->tag = tag;
+        metrics->bytes_read +=  bytesxbloque;
+        metrics->rmiss++;
+        metrics->loads++;
+        metrics->read_time += 1 + MISS_PENALTY;
+    }
+}
+
+void linea_dirty_miss(Set *set_actual, Metrics *metrics, int tag, Entrada *operacion_actual, Linea *linea_actual, int bytesxbloque){
+
+    linea_actual->ultima_operacion = operacion_actual->numero_de_operacion;
+    if(strcmp(&(operacion_actual->operacion), "W") == 0){
+        linea_actual->dirtybit = true;
+        linea_actual->tag = tag;
+        metrics->bytes_written +=  bytesxbloque;
+        metrics->bytes_read +=  bytesxbloque;
+        metrics->stores++;
+        metrics->wmiss++;
+        metrics->dirty_wmiss++;
+        metrics->write_time += 1 + (2 * MISS_PENALTY);
+    }
+    else if(strcmp(&(operacion_actual->operacion), "R") == 0){ 
+        linea_actual->dirtybit = false;
+        linea_actual->tag = tag;
+        metrics->bytes_read +=  bytesxbloque;
+        metrics->bytes_written +=  bytesxbloque;
+        metrics->dirty_rmiss+=1;
+        metrics->rmiss++;
+        metrics->loads++;
+        metrics->read_time += 1 + (MISS_PENALTY * 2);
+    }
+}
+
+void linea_hit(Linea *linea_actual, Metrics *metrics, int tag, Entrada *operacion_actual){
+
+    linea_actual->ultima_operacion = operacion_actual->numero_de_operacion;
+    if(strcmp(&(operacion_actual->operacion), "W") == 0){ 
+        linea_actual->dirtybit = true;
+        metrics->write_time+=1;
+        metrics->stores++;
+        return;
+    }
+    else if(strcmp(&(operacion_actual->operacion), "R") == 0){
+        metrics->read_time+=1;
+        metrics->loads++;
+        return;
+    }
+}
+
+void modo_simple(Cache *cache, int tag, int set_index, Entrada *entrada, int bytesxbloque){
+
+    Set *set_actual = cache->sets[set_index];
+    Linea *linea = encontrar_linea(set_actual, tag);
+    bool set_esta_lleno = false;
+    if(set_actual->cantidad_lineas == set_actual->lineas_ocupadas)
+        set_esta_lleno = true;
+
+    if(!linea && !set_esta_lleno){
+        linea_fria(set_actual, cache->metrics, tag, entrada, bytesxbloque);
+    }
+    else if(!linea && set_esta_lleno){
+        Linea *ultima_linea_usada = least_recently_used(set_actual);
+        if(ultima_linea_usada->dirtybit == false){
+            linea_clean_miss(set_actual, cache->metrics, tag, entrada, ultima_linea_usada, bytesxbloque);
+        }
+        else{
+            linea_dirty_miss(set_actual, cache->metrics, tag, entrada, ultima_linea_usada, bytesxbloque);
+        }
+    }
+    else if(linea && linea->validez == true){
+        linea_hit(linea, cache->metrics, tag, entrada);
+    }
+}
+
+void devolver_resumen(Cache *cache, int E, int tamanio_cache){
+    if(cache->mapeo_directo)
+        printf("direct-mapped, ");
+    else
+        printf("%i-way, ", E);
+    printf("%i sets, size = %iKB\n", cache->cantidad_sets, (int)(tamanio_cache/1000));
+    printf("loads %i stores %i total %i\n", cache->metrics->loads, cache->metrics->stores, cache->metrics->stores+cache->metrics->loads);
+    printf("rmiss %i wmiss %i total %i\n", cache->metrics->rmiss, cache->metrics->wmiss, cache->metrics->rmiss+cache->metrics->wmiss);
+    printf("dirty rmiss %i dirty wmiss %i\n", cache->metrics->dirty_rmiss, cache->metrics->dirty_wmiss);
+    printf("bytes read %i bytes written %i\n", cache->metrics->bytes_read, cache->metrics->bytes_written);
+    printf("read time %i write time %i\n", cache->metrics->read_time, cache->metrics->write_time);
+    printf("miss rate %f\n", (double)(cache->metrics->rmiss+cache->metrics->wmiss)/(cache->metrics->stores+cache->metrics->loads));
+}
+
+void destruir_cache(Cache *cache){
+    
+    for(int i = 0; i < cache->cantidad_sets; i++){
+        Set *set_actual = cache->sets[i];
+        for(int j = 0; j < set_actual->cantidad_lineas; j++){
+            free(set_actual->lineas[j]);
+        }
+        free(set_actual->lineas);
+        free(set_actual);
+    }
+    free(cache->sets);
+    free(cache->metrics);
+    free(cache);
+}
+
+int main(int argc, char const *argv[]){//argv[4] -> nro de Sets; argv[3] -> asociatividad de la cache; argv[2] -> tamanio cache
+    if(argc != 5 && argc != 8)
         return ERROR;
 
-    if(!son_potencia_2(argv)) //argumentos no son pares [2] ; [3] ; [4]
+    bool es_verboso = false;
+    if(argc == 8)
+        es_verboso = true;
+
+    if(!son_potencia_2(argv))
         return ERROR;
 
-    Cache *cache = crear_cache(argv);   //crea cache
+    Cache *cache = crear_cache(argv);
     if(!cache)
         return ERROR;
-
+    size_t numero_de_operacion = 0;
     FILE *archivo = fopen(argv[1], "r");
-    if(!archivo)
+    if(!archivo){
+        printf("ERROR ARCHIVO\n");
         return ERROR;
-    while(!feof){
-        Entrada *entrada = NULL;
-        fscanf(archivo, entrada->instruction_pointer, entrada->operacion, entrada->direccion, entrada->tamanio_operacion, entrada->datos_leidos); // guardo datosa de la liena;
-        ///Datos de la direccion
+    }
+    while(!feof(archivo)){
+
+        Entrada *entrada = calloc(1, sizeof(Entrada));
+        fscanf(archivo, "%i: %c %i %i %i", &(entrada->instruction_pointer), &(entrada->operacion), &(entrada->direccion), &(entrada->tamanio_operacion), &(entrada->datos_leidos)); // guardo datosa de la liena;
+        
+        entrada->numero_de_operacion = numero_de_operacion;
+        if(entrada->instruction_pointer == 0 && entrada->operacion == 0 && entrada->direccion == 0 && entrada->tamanio_operacion == 0 && entrada->datos_leidos == 0){
+            break;
+        }
         int set_index;
         int tag;
         int bloque;
-        seti_y_tag(entrada->direccion ,&set_index, &tag /*, ALGO MAS*/);
-        ///
-
-        if(argc == 5)
-            modo_simple();
-
-
+        int bytesxbloque = (atoi(argv[2]) / (atoi(argv[3]) * atoi(argv[4])));
+       
+        seti_y_tag(&(entrada->direccion), log2(atoi(argv[4])), log2(bytesxbloque) ,&set_index, &tag);
+        if(!es_verboso)
+            modo_simple(cache, tag, set_index, entrada, bytesxbloque);
+        free(entrada);
+        numero_de_operacion++;
+        
+        if(feof(archivo)){
+            break;
+        }
     }
+    fclose(archivo);
+    devolver_resumen(cache, atoi(argv[3]), atoi(argv[2]));
+    destruir_cache(cache);
     return 0;
 }
-
-
-//funcion que encuentra la linea dentro del set dado en el parametro
-
-//funcion para write
-
-//funcion para read
-
