@@ -1,7 +1,6 @@
-VALGRIND_FLAGS=--leak-check=full --track-origins=yes --show-reachable=yes
-CC = gcc
+CFLAGS ?= -g -O2 -std=gnu11 -Wall -Wextra -Wvla
+LDLIBS := -lm
 
-all: cachesim
+cachesim: cachesim.o
 
-cachesim: main.c
-	$(CC) main.c -o cachesim -lm
+.PHONY: clean
